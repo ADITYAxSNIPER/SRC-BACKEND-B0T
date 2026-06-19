@@ -24,6 +24,7 @@ const ADMIN_COMMANDS = [
   { command: "schedule",       description: "Schedule a broadcast" },
   { command: "schedules",      description: "View pending scheduled broadcasts" },
   { command: "cancelschedule", description: "Cancel a scheduled broadcast" },
+  { command: "ping",           description: "Check bot & DB health" },
   { command: "admin",          description: "Open admin panel" },
 ];
 

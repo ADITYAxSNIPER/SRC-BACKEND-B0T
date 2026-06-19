@@ -1529,6 +1529,51 @@ export function registerAdminHandlers(bot: Telegraf) {
   }));
 
   // ════════════════════════════════
+  // PING — live health check
+  // ════════════════════════════════
+
+  bot.command("ping", adminOnly(async (ctx) => {
+    const start = Date.now();
+
+    let dbStatus = `${CE.check} Connected`;
+    let userCount = 0;
+    let orderCount = 0;
+    try {
+      const [u] = await db.select({ count: count() }).from(usersTable);
+      const [o] = await db.select({ count: count() }).from(ordersTable);
+      userCount = u.count;
+      orderCount = o.count;
+    } catch {
+      dbStatus = `${CE.explosion} Error`;
+    }
+
+    const dbMs = Date.now() - start;
+    const uptimeSeconds = Math.floor(process.uptime());
+    const h = Math.floor(uptimeSeconds / 3600);
+    const m = Math.floor((uptimeSeconds % 3600) / 60);
+    const s = uptimeSeconds % 60;
+    const uptime = h > 0 ? `${h}h ${m}m ${s}s` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+
+    const memMb = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
+
+    await ctx.reply(
+      `${CE.shield} <b>CELLIK R4T — Health Check</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `${CE.check} <b>Bot:</b> Online\n` +
+        `${CE.lightning} <b>Uptime:</b> ${uptime}\n` +
+        `${CE.tool} <b>Memory:</b> ${memMb} MB\n` +
+        `${CE.calendar} <b>DB Query:</b> ${dbMs}ms\n\n` +
+        `${CE.globe} <b>Database</b>\n` +
+        `<blockquote>${dbStatus}\n` +
+        `${CE.cool} Users: <b>${userCount}</b>\n` +
+        `${CE.cart} Orders: <b>${orderCount}</b></blockquote>\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `<i>Pong! Everything is running.</i> ${CE.thumbsup}`,
+      { parse_mode: "HTML" },
+    );
+  }));
+
+  // ════════════════════════════════
   // BROADCAST COMMAND
   // ════════════════════════════════
 
