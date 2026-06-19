@@ -16,6 +16,7 @@ const ADMIN_COMMANDS = [
   { command: "lookup",         description: "Lookup by TKT / user ID / @username" },
   { command: "confirmorder",   description: "Confirm order & notify user" },
   { command: "cancelorder",    description: "Cancel order & notify user" },
+  { command: "deliver",        description: "Mark order as delivered & notify buyer" },
   { command: "adduser",        description: "Grant manual access to a user" },
   { command: "message",        description: "DM any user via bot" },
   { command: "broadcast",      description: "Send message to all users" },
