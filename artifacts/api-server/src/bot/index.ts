@@ -90,6 +90,11 @@ export async function startBot(): Promise<Telegraf | null> {
     return null;
   }
 
+  if (process.env.DISABLE_BOT === "true") {
+    logger.info("DISABLE_BOT=true — bot disabled on this instance (Render handles it)");
+    return null;
+  }
+
   const bot = new Telegraf(token);
   const secret = makeWebhookSecret(token);
   webhookSecret = secret;
