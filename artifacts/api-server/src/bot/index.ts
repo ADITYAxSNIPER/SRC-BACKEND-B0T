@@ -99,34 +99,6 @@ async function startViaPolling(bot: Telegraf): Promise<void> {
 
 // ── startBot ──────────────────────────────────────────────────
 
-export async function startBot(): Promise<Telegraf | null> {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token) {
-    logger.warn("TELEGRAM_BOT_TOKEN not set — bot will not start");
-    return null;
-  }
-
-  if (process.env.DISABLE_BOT === "true") {
-    logger.info("DISABLE_BOT=true — bot disabled on this instance (Render handles it)");
-    return null;
-  }
-
-  const bot = new Telegraf(token);
-  const secret = makeWebhookSecret(token);
-  webhookSecret = secret;
-
-  registerCustomerHandlers(bot);
-  registerAdminHandlers(bot);
-
-  bot.catch((err, ctx) => {
-    logger.error({ err, updateType: ctx.updateType }, "Bot middleware error");
-  });
-
-  // Start on-chain payment poller (every 90s)
-  startPoller(bot);
-
-  // Start scheduled broadcast runner (every 60s)
-  startScheduler(bot);
 
   // Set admin commands — fire-and-forget so a slow Telegram API call
   // never blocks webhook registration or bot initialisation.
@@ -148,7 +120,7 @@ export async function startBot(): Promise<Telegraf | null> {
     process.env.REPLIT_DEV_DOMAIN;
 
   if (domain) {
-    const webhookUrl = `${domain}/api/bot/webhook`;`;
+    const webhookUrl = `https://${domain}/api/bot/webhook`;`;
     startViaWebhook(bot, webhookUrl, secret).catch((err) => {
       logger.error({ err }, "Webhook startup failed unexpectedly");
     });
