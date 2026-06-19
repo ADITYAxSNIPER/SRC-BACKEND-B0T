@@ -146,7 +146,11 @@ export async function startBot(): Promise<Telegraf | null> {
 
 export function stopBot(): void {
   if (botInstance) {
-    botInstance.stop("SIGTERM");
+    try {
+      botInstance.stop("SIGTERM");
+    } catch {
+      // "Bot is not running!" — expected in passive webhook mode (no polling started)
+    }
     botInstance = null;
     logger.info("Telegram bot stopped");
   }
