@@ -19,6 +19,10 @@ import { cbtn, ubtn, ICON, COIN_ICON } from "../buttons";
 import { getCryptoAmount, getPaymentQrUrl } from "../payments";
 import { logger } from "../../lib/logger";
 import { sendAdminAlert } from "./admin";
+import {
+  getSetting, setSetting, isMaintenanceMode, getWelcomeMessage, getBlacklist,
+} from "../settings";
+import { ADMIN_IDS } from "../config";
 
 // ──────────────────────────────────────────────
 // Helpers
@@ -167,7 +171,44 @@ const FEATURES_EXTRA = Markup.inlineKeyboard([
 // Register handlers
 // ──────────────────────────────────────────────
 
+// ──────────────────────────────────────────────
+// Guards
+// ──────────────────────────────────────────────
+
+async function checkMaintenance(ctx: Context): Promise<boolean> {
+  const isAdmin = ADMIN_IDS.includes((ctx.from?.id ?? 0));
+  if (isAdmin) return false;
+  const on = await isMaintenanceMode();
+  if (on) {
+    await ctx.reply(
+      `${CE.wrench} <b>Bot Under Maintenance</b>\n\n` +
+        `<blockquote><i>We're currently performing maintenance. Please check back shortly.</i>\n\n` +
+        `Contact support: ${SELLER_URL}</blockquote>`,
+      { parse_mode: "HTML" },
+    );
+    return true;
+  }
+  return false;
+}
+
 export function registerCustomerHandlers(bot: Telegraf) {
+
+  // ── Global blacklist check on all text messages ──
+  bot.on("text", async (ctx, next) => {
+    const isAdmin = ADMIN_IDS.includes(ctx.from.id);
+    if (isAdmin) return next();
+    const text = (ctx.message.text ?? "").toLowerCase();
+    const words = await getBlacklist();
+    const hit = words.find((w) => text.includes(w));
+    if (hit) {
+      await db.update(usersTable).set({ isBanned: true }).where(eq(usersTable.telegramId, ctx.from.id));
+      await ctx.reply(`${CE.banned} You have been banned from this service.`, { parse_mode: "HTML" });
+      logger.warn({ userId: ctx.from.id, word: hit }, "User auto-banned for blacklisted word");
+      return;
+    }
+    return next();
+  });
+
   // ── /start ──
   bot.start(async (ctx) => {
     const { id, username, first_name } = ctx.from;
@@ -178,12 +219,20 @@ export function registerCustomerHandlers(bot: Telegraf) {
       return;
     }
 
-    await ctx.reply(welcomeGreeting(first_name), { parse_mode: "HTML" });
+    if (await checkMaintenance(ctx)) return;
+
+    const customWelcome = await getWelcomeMessage();
+    const greeting = customWelcome
+      ? customWelcome.replace(/\{name\}/g, first_name)
+      : welcomeGreeting(first_name);
+
+    await ctx.reply(greeting, { parse_mode: "HTML" });
     await ctx.reply(MAIN_MENU_TEXT, { parse_mode: "HTML", ...MAIN_MENU_KEYBOARD });
   });
 
   // ── /menu ──
   bot.command("menu", async (ctx) => {
+    if (await checkMaintenance(ctx)) return;
     const user = await db.query.usersTable.findFirst({
       where: eq(usersTable.telegramId, ctx.from.id),
     });
@@ -192,6 +241,48 @@ export function registerCustomerHandlers(bot: Telegraf) {
       return;
     }
     await ctx.reply(MAIN_MENU_TEXT, { parse_mode: "HTML", ...MAIN_MENU_KEYBOARD });
+  });
+
+  // ── /redeem — customer coupon redemption ──
+  bot.command("redeem", async (ctx) => {
+    if (await checkMaintenance(ctx)) return;
+    const msg = ctx.message;
+    const code = (msg.text.split(/\s+/)[1] ?? "").toUpperCase().trim();
+    if (!code) {
+      await ctx.reply(
+        `${CE.money} <b>Redeem a Coupon</b>\n\n` +
+          `<blockquote>${CE.wrench} <b>Usage:</b> /redeem &lt;CODE&gt;\n\n` +
+          `<i>Example: /redeem SUMMER20</i></blockquote>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    const percent = await getSetting(`coupon:${code}`);
+    if (!percent) {
+      await ctx.reply(
+        `${CE.explosion} Coupon <code>${code}</code> is invalid or expired.\n` +
+          `<i>Check the code and try again.</i>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    const userId = ctx.from.id;
+    await setSetting(`discount:${userId}`, percent);
+    await ctx.reply(
+      `${CE.thumbsup} <b>Coupon Applied!</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `<blockquote>${CE.money} <b>${percent}% OFF</b> applied to your account!\n\n` +
+        `<i>Your discount is active on your next purchase.\nTap below to choose a plan.</i></blockquote>`,
+      {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [cbtn("View Plans", "show_plans", { style: "success", icon: ICON.cart })],
+        ]),
+      },
+    );
+    logger.info({ userId, code, percent }, "User redeemed coupon");
   });
 
   // ── /features ──

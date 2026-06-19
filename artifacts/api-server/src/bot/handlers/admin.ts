@@ -1,6 +1,6 @@
 import { Telegraf, Markup, type Context } from "telegraf";
 import type { Message } from "telegraf/types";
-import { db, pool } from "@workspace/db";
+import { db } from "@workspace/db";
 import { usersTable, ordersTable, scheduledBroadcastsTable } from "@workspace/db/schema";
 import { eq, desc, count, and, gte, ilike, ne } from "drizzle-orm";
 import { ADMIN_IDS, PLANS, getPlan, SELLER_URL, WALLETS, type CoinSymbol } from "../config";
@@ -8,37 +8,12 @@ import { CE, BE } from "../emoji";
 import { cbtn, ubtn, ICON, COIN_ICON } from "../buttons";
 import { getCryptoAmount, getPaymentQrUrl, checkPaymentReceived } from "../payments";
 import { logger } from "../../lib/logger";
+import {
+  getSetting, setSetting, deleteSetting, getAllSettings,
+  getEffectivePrice, isMaintenanceMode,
+} from "../settings";
 
-// ──────────────────────────────────────────────
-// Settings helpers (plan price overrides in DB)
-// ──────────────────────────────────────────────
-
-async function getSetting(key: string): Promise<string | null> {
-  try {
-    const res = await pool.query<{ value: string }>(
-      "SELECT value FROM settings WHERE key = $1", [key],
-    );
-    return res.rows[0]?.value ?? null;
-  } catch { return null; }
-}
-
-async function setSetting(key: string, value: string): Promise<void> {
-  await pool.query(
-    `INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
-     ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
-    [key, value],
-  );
-}
-
-async function deleteSetting(key: string): Promise<void> {
-  await pool.query("DELETE FROM settings WHERE key = $1", [key]);
-}
-
-export async function getEffectivePrice(planId: string): Promise<number> {
-  const override = await getSetting(`plan_price:${planId}`);
-  if (override !== null) return parseFloat(override);
-  return PLANS.find((p) => p.id === planId)?.price ?? 0;
-}
+export { getEffectivePrice };
 
 // ──────────────────────────────────────────────
 // Utilities
@@ -1605,6 +1580,438 @@ export function registerAdminHandlers(bot: Telegraf) {
         `\n\n━━━━━━━━━━━━━━━━━━━━━━━`,
       { parse_mode: "HTML" },
     );
+  }));
+
+  // ════════════════════════════════
+  // COUPON — create / list / delete discount codes
+  // ════════════════════════════════
+
+  bot.command("coupon", adminOnly(async (ctx) => {
+    const msg = ctx.message as Message.TextMessage;
+    const parts = msg.text.split(/\s+/);
+    const code = parts[1]?.toUpperCase().trim();
+    const percent = parseFloat(parts[2] ?? "");
+
+    if (!code) {
+      await ctx.reply(
+        `${CE.money} <b>Coupon Command</b>\n\n` +
+          `<blockquote>${CE.wrench} <b>Usage:</b>\n` +
+          `/coupon &lt;CODE&gt; &lt;percent&gt; — create coupon\n` +
+          `/coupons — list all active coupons\n` +
+          `/deletecoupon &lt;CODE&gt; — delete coupon\n\n` +
+          `<i>Example: /coupon SUMMER20 20</i>\n` +
+          `<i>Customers use: /redeem SUMMER20</i></blockquote>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    if (isNaN(percent) || percent <= 0 || percent > 100) {
+      await ctx.reply(
+        `${CE.explosion} Invalid percent. Must be 1–100.\n` +
+          `<i>Example: /coupon VIP50 50</i>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    await setSetting(`coupon:${code}`, String(percent));
+    await ctx.reply(
+      `${CE.thumbsup} <b>Coupon Created</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `<blockquote>${CE.money} <b>Code:</b> <code>${htmlEscape(code)}</code>\n` +
+        `${CE.check} <b>Discount:</b> <b>${percent}% OFF</b>\n\n` +
+        `<i>Customers can use: /redeem ${htmlEscape(code)}</i></blockquote>`,
+      { parse_mode: "HTML" },
+    );
+    logger.info({ adminId: ctx.from!.id, code, percent }, "Coupon created");
+  }));
+
+  bot.command("coupons", adminOnly(async (ctx) => {
+    const rows = await getAllSettings("coupon:");
+    if (rows.length === 0) {
+      await ctx.reply(`${CE.money} <b>No active coupons.</b>\n<i>Create one: /coupon CODE percent</i>`, { parse_mode: "HTML" });
+      return;
+    }
+    const lines = rows.map((r) => {
+      const code = r.key.replace("coupon:", "");
+      return `${CE.check} <code>${htmlEscape(code)}</code> — <b>${r.value}% OFF</b>`;
+    }).join("\n");
+    await ctx.reply(
+      `${CE.money} <b>Active Coupons</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        lines +
+        `\n\n━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `<i>/deletecoupon &lt;CODE&gt; to remove</i>`,
+      { parse_mode: "HTML" },
+    );
+  }));
+
+  bot.command("deletecoupon", adminOnly(async (ctx) => {
+    const msg = ctx.message as Message.TextMessage;
+    const code = msg.text.split(/\s+/)[1]?.toUpperCase().trim();
+    if (!code) {
+      await ctx.reply(`${CE.wrench} <b>Usage:</b> /deletecoupon &lt;CODE&gt;`, { parse_mode: "HTML" });
+      return;
+    }
+    const exists = await getSetting(`coupon:${code}`);
+    if (!exists) {
+      await ctx.reply(`${CE.explosion} Coupon <code>${htmlEscape(code)}</code> not found.`, { parse_mode: "HTML" });
+      return;
+    }
+    await deleteSetting(`coupon:${code}`);
+    await ctx.reply(
+      `${CE.thumbsup} Coupon <code>${htmlEscape(code)}</code> deleted.`,
+      { parse_mode: "HTML" },
+    );
+  }));
+
+  // ════════════════════════════════
+  // REFUND — mark order refunded + notify buyer
+  // ════════════════════════════════
+
+  bot.command("refund", adminOnly(async (ctx) => {
+    const msg = ctx.message as Message.TextMessage;
+    const parts = msg.text.split(/\s+/);
+    const tktArg = parts[1]?.toUpperCase().trim();
+
+    if (!tktArg) {
+      await ctx.reply(
+        `${CE.money} <b>Refund Command</b>\n\n` +
+          `<blockquote>${CE.wrench} <b>Usage:</b> /refund &lt;TKT-XXXXXX&gt;</blockquote>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    const orderId = parseInt(tktArg.replace(/^TKT-0*/, ""), 10);
+    const order = await db.query.ordersTable.findFirst({ where: eq(ordersTable.id, orderId) });
+    if (!order) {
+      await ctx.reply(`${CE.explosion} Order <code>${htmlEscape(tktArg)}</code> not found.`, { parse_mode: "HTML" });
+      return;
+    }
+
+    await db.update(ordersTable)
+      .set({ paymentStatus: "refunded" as never })
+      .where(eq(ordersTable.id, orderId));
+
+    try {
+      await ctx.telegram.sendMessage(
+        order.telegramId,
+        `${CE.money} <b>Refund Issued</b>\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+          `<blockquote>Your order <b>${tktArg}</b> (<b>${order.planName}</b>) has been refunded.\n\n` +
+          `<i>If you have questions, contact support.</i></blockquote>`,
+        { parse_mode: "HTML" },
+      );
+    } catch { /* user may have blocked bot */ }
+
+    await ctx.reply(
+      `${CE.thumbsup} <b>Refund Processed</b>\n` +
+        `<blockquote>${CE.check} Order <b>${tktArg}</b> marked as refunded.\nBuyer notified.</blockquote>`,
+      { parse_mode: "HTML" },
+    );
+    logger.info({ adminId: ctx.from!.id, orderId }, "Order refunded");
+  }));
+
+  // ════════════════════════════════
+  // NOTE — add private admin note to an order
+  // ════════════════════════════════
+
+  bot.command("note", adminOnly(async (ctx) => {
+    const msg = ctx.message as Message.TextMessage;
+    const parts = msg.text.split(/\s+/);
+    const tktArg = parts[1]?.toUpperCase().trim();
+    const noteText = parts.slice(2).join(" ").trim();
+
+    if (!tktArg || !noteText) {
+      await ctx.reply(
+        `${CE.wrench} <b>Usage:</b> /note &lt;TKT-XXXXXX&gt; &lt;your note text&gt;\n` +
+          `<i>Example: /note TKT-000123 VIP customer — priority support</i>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    const orderId = parseInt(tktArg.replace(/^TKT-0*/, ""), 10);
+    const order = await db.query.ordersTable.findFirst({ where: eq(ordersTable.id, orderId) });
+    if (!order) {
+      await ctx.reply(`${CE.explosion} Order <code>${htmlEscape(tktArg)}</code> not found.`, { parse_mode: "HTML" });
+      return;
+    }
+
+    await setSetting(`note:${orderId}`, noteText);
+    await ctx.reply(
+      `${CE.thumbsup} <b>Note Saved</b>\n` +
+        `<blockquote>${CE.wrench} Order: <b>${tktArg}</b>\n` +
+        `${CE.check} Note: <i>${htmlEscape(noteText)}</i></blockquote>`,
+      { parse_mode: "HTML" },
+    );
+  }));
+
+  // ════════════════════════════════
+  // EXPORTUSERS — dump all users as text
+  // ════════════════════════════════
+
+  bot.command("exportusers", adminOnly(async (ctx) => {
+    const users = await db.query.usersTable.findMany({ orderBy: [desc(usersTable.createdAt)] });
+    if (users.length === 0) {
+      await ctx.reply(`${CE.users} <b>No users yet.</b>`, { parse_mode: "HTML" });
+      return;
+    }
+
+    const lines = users.map((u) => {
+      const name = u.username ? `@${u.username}` : u.firstName;
+      const status = u.isBanned ? " [BANNED]" : "";
+      const joined = u.createdAt ? new Date(u.createdAt).toISOString().split("T")[0] : "?";
+      return `${u.telegramId} | ${name}${status} | ${joined}`;
+    });
+
+    const header = `CELLIK R4T — User Export (${users.length} users)\nID | Name | Joined\n${"─".repeat(50)}\n`;
+    const full = header + lines.join("\n");
+
+    if (full.length < 4000) {
+      await ctx.reply(`<pre>${htmlEscape(full)}</pre>`, { parse_mode: "HTML" });
+    } else {
+      const buf = Buffer.from(full, "utf-8");
+      await ctx.replyWithDocument(
+        { source: buf, filename: `users_${Date.now()}.txt` },
+        { caption: `${CE.users} <b>${users.length} users exported</b>`, parse_mode: "HTML" },
+      );
+    }
+  }));
+
+  // ════════════════════════════════
+  // ALERT — urgent styled blast to all users
+  // ════════════════════════════════
+
+  bot.command("alert", adminOnly(async (ctx) => {
+    const msg = ctx.message as Message.TextMessage;
+    const alertText = msg.text.replace(/^\/alert\s*/i, "").trim();
+
+    if (!alertText) {
+      await ctx.reply(
+        `${CE.explosion} <b>Usage:</b> /alert &lt;your urgent message&gt;\n` +
+          `<i>Sends a red-styled alert to all users immediately.</i>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    const users = await db.query.usersTable.findMany({ where: eq(usersTable.isBanned, false) });
+    const payload =
+      `${CE.explosion}${CE.explosion} <b>URGENT ALERT</b> ${CE.explosion}${CE.explosion}\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `<blockquote>${htmlEscape(alertText)}</blockquote>\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `<i>— CELLIK R4T Team</i>`;
+
+    let sent = 0, failed = 0;
+    for (const u of users) {
+      try {
+        await ctx.telegram.sendMessage(u.telegramId, payload, { parse_mode: "HTML" });
+        sent++;
+      } catch { failed++; }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    await ctx.reply(
+      `${CE.thumbsup} <b>Alert Sent</b>\n` +
+        `<blockquote>${CE.check} Delivered: <b>${sent}</b>\n` +
+        `${CE.explosion} Failed: <b>${failed}</b></blockquote>`,
+      { parse_mode: "HTML" },
+    );
+    logger.info({ adminId: ctx.from!.id, sent, failed }, "Alert blast sent");
+  }));
+
+  // ════════════════════════════════
+  // BOTSTATS — live metrics dashboard
+  // ════════════════════════════════
+
+  bot.command("botstats", adminOnly(async (ctx) => {
+    const [
+      [totalUsers],
+      [bannedUsers],
+      [totalOrders],
+      [paidOrders],
+      [pendingOrders],
+    ] = await Promise.all([
+      db.select({ c: count() }).from(usersTable),
+      db.select({ c: count() }).from(usersTable).where(eq(usersTable.isBanned, true)),
+      db.select({ c: count() }).from(ordersTable),
+      db.select({ c: count() }).from(ordersTable).where(eq(ordersTable.paymentStatus, "finished")),
+      db.select({ c: count() }).from(ordersTable).where(eq(ordersTable.paymentStatus, "waiting")),
+    ]);
+
+    const revenueRows = await db.query.ordersTable.findMany({
+      where: eq(ordersTable.paymentStatus, "finished"),
+    });
+    const totalRevenue = revenueRows.reduce((s, o) => s + (parseFloat(o.planPriceUsd) || 0), 0);
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const [todayUsers] = await db.select({ c: count() }).from(usersTable)
+      .where(gte(usersTable.createdAt, todayStart));
+    const [todayOrders] = await db.select({ c: count() }).from(ordersTable)
+      .where(and(eq(ordersTable.paymentStatus, "finished"), gte(ordersTable.createdAt, todayStart)));
+
+    const planBreakdown = await Promise.all(PLANS.map(async (p) => {
+      const [row] = await db.select({ c: count() }).from(ordersTable)
+        .where(and(eq(ordersTable.planId, p.id as never), eq(ordersTable.paymentStatus, "finished")));
+      return `${p.emoji} <b>${p.name}:</b> ${row?.c ?? 0} sales`;
+    }));
+
+    const maintenanceOn = await isMaintenanceMode();
+
+    await ctx.reply(
+      `${CE.lightning} <b>Bot Stats</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `${CE.users} <b>Users</b>\n` +
+        `<blockquote>Total: <b>${totalUsers?.c ?? 0}</b>  ·  Banned: <b>${bannedUsers?.c ?? 0}</b>\n` +
+        `New Today: <b>${todayUsers?.c ?? 0}</b></blockquote>\n\n` +
+        `${CE.money} <b>Revenue</b>\n` +
+        `<blockquote>Total: <b>$${totalRevenue.toLocaleString()}</b>\n` +
+        `Paid Orders: <b>${paidOrders?.c ?? 0}</b>  ·  Pending: <b>${pendingOrders?.c ?? 0}</b>\n` +
+        `Sales Today: <b>${todayOrders?.c ?? 0}</b></blockquote>\n\n` +
+        `${CE.shield} <b>Plan Breakdown</b>\n` +
+        `<blockquote>${planBreakdown.join("\n")}</blockquote>\n\n` +
+        `${CE.wrench} <b>Status:</b> Maintenance ${maintenanceOn ? `${CE.explosion} <b>ON</b>` : `${CE.check} OFF`}\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━`,
+      { parse_mode: "HTML" },
+    );
+  }));
+
+  // ════════════════════════════════
+  // BLACKLIST — auto-ban words
+  // ════════════════════════════════
+
+  bot.command("blacklist", adminOnly(async (ctx) => {
+    const msg = ctx.message as Message.TextMessage;
+    const word = msg.text.split(/\s+/)[1]?.toLowerCase().trim();
+
+    if (!word) {
+      await ctx.reply(
+        `${CE.banned} <b>Blacklist Command</b>\n\n` +
+          `<blockquote>${CE.wrench} <b>Usage:</b>\n` +
+          `/blacklist &lt;word&gt; — add word\n` +
+          `/blacklisted — view all words\n` +
+          `/unblacklist &lt;word&gt; — remove word\n\n` +
+          `<i>Users sending blacklisted words are auto-banned.</i></blockquote>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    const current = await getSetting("blacklist") ?? "";
+    const words = current.split(",").map((w) => w.trim()).filter(Boolean);
+    if (words.includes(word)) {
+      await ctx.reply(`${CE.explosion} <code>${htmlEscape(word)}</code> is already blacklisted.`, { parse_mode: "HTML" });
+      return;
+    }
+    words.push(word);
+    await setSetting("blacklist", words.join(","));
+    await ctx.reply(
+      `${CE.thumbsup} Word <code>${htmlEscape(word)}</code> added to blacklist.\n` +
+        `<i>Any user sending it will be auto-banned.</i>`,
+      { parse_mode: "HTML" },
+    );
+  }));
+
+  bot.command("blacklisted", adminOnly(async (ctx) => {
+    const raw = await getSetting("blacklist");
+    if (!raw) {
+      await ctx.reply(`${CE.banned} <b>Blacklist is empty.</b>\n<i>/blacklist &lt;word&gt; to add one.</i>`, { parse_mode: "HTML" });
+      return;
+    }
+    const words = raw.split(",").map((w) => w.trim()).filter(Boolean);
+    await ctx.reply(
+      `${CE.banned} <b>Blacklisted Words (${words.length})</b>\n\n` +
+        words.map((w) => `• <code>${htmlEscape(w)}</code>`).join("\n"),
+      { parse_mode: "HTML" },
+    );
+  }));
+
+  bot.command("unblacklist", adminOnly(async (ctx) => {
+    const msg = ctx.message as Message.TextMessage;
+    const word = msg.text.split(/\s+/)[1]?.toLowerCase().trim();
+    if (!word) {
+      await ctx.reply(`${CE.wrench} <b>Usage:</b> /unblacklist &lt;word&gt;`, { parse_mode: "HTML" });
+      return;
+    }
+    const raw = await getSetting("blacklist") ?? "";
+    const words = raw.split(",").map((w) => w.trim()).filter((w) => w && w !== word);
+    await setSetting("blacklist", words.join(","));
+    await ctx.reply(`${CE.thumbsup} <code>${htmlEscape(word)}</code> removed from blacklist.`, { parse_mode: "HTML" });
+  }));
+
+  // ════════════════════════════════
+  // SETWELCOME — custom welcome message
+  // ════════════════════════════════
+
+  bot.command("setwelcome", adminOnly(async (ctx) => {
+    const msg = ctx.message as Message.TextMessage;
+    const text = msg.text.replace(/^\/setwelcome\s*/i, "").trim();
+
+    if (!text || text === "reset") {
+      if (text === "reset") {
+        await deleteSetting("welcome_message");
+        await ctx.reply(`${CE.thumbsup} Welcome message reset to default.`, { parse_mode: "HTML" });
+        return;
+      }
+      await ctx.reply(
+        `${CE.speak} <b>Set Welcome Message</b>\n\n` +
+          `<blockquote>${CE.wrench} <b>Usage:</b>\n` +
+          `/setwelcome &lt;your message&gt;\n` +
+          `/setwelcome reset — restore default\n\n` +
+          `<b>Available variables:</b>\n` +
+          `<code>{name}</code> — user's first name\n\n` +
+          `<i>Example:\n/setwelcome Hey {name}! Welcome to CELLIK R4T 🔥</i></blockquote>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    await setSetting("welcome_message", text);
+    const preview = text.replace(/\{name\}/g, ctx.from!.first_name);
+    await ctx.reply(
+      `${CE.thumbsup} <b>Welcome Message Saved</b>\n\n` +
+        `<blockquote><b>Preview:</b>\n${htmlEscape(preview)}</blockquote>`,
+      { parse_mode: "HTML" },
+    );
+  }));
+
+  // ════════════════════════════════
+  // MAINTENANCE — toggle maintenance mode
+  // ════════════════════════════════
+
+  bot.command("maintenance", adminOnly(async (ctx) => {
+    const msg = ctx.message as Message.TextMessage;
+    const arg = msg.text.split(/\s+/)[1]?.toLowerCase().trim();
+    const current = await isMaintenanceMode();
+
+    if (!arg || (arg !== "on" && arg !== "off")) {
+      await ctx.reply(
+        `${CE.wrench} <b>Maintenance Mode</b>\n\n` +
+          `<blockquote>Status: ${current ? `${CE.explosion} <b>ON</b>` : `${CE.check} <b>OFF</b>`}\n\n` +
+          `<i>/maintenance on — enable (blocks all customer commands)\n` +
+          `/maintenance off — disable</i></blockquote>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    const newState = arg === "on";
+    await setSetting("maintenance_mode", String(newState));
+
+    await ctx.reply(
+      `${CE.thumbsup} <b>Maintenance Mode ${newState ? "ENABLED" : "DISABLED"}</b>\n` +
+        `<blockquote>${newState
+          ? `${CE.explosion} Bot is now in maintenance — all customer commands blocked.`
+          : `${CE.check} Bot is back online — customers can use it normally.`
+        }</blockquote>`,
+      { parse_mode: "HTML" },
+    );
+    logger.info({ adminId: ctx.from!.id, maintenance: newState }, "Maintenance mode changed");
   }));
 
   // ════════════════════════════════
