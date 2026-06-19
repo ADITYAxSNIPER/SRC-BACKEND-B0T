@@ -46,6 +46,12 @@ async function runMigrations(): Promise<void> {
         created_by   BIGINT NOT NULL,
         created_at   TIMESTAMP NOT NULL DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS settings (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+      );
     `);
     logger.info("DB migrations complete");
   } finally {

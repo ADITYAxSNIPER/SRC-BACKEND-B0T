@@ -25,6 +25,9 @@ const ADMIN_COMMANDS = [
   { command: "schedule",       description: "Schedule a broadcast" },
   { command: "schedules",      description: "View pending scheduled broadcasts" },
   { command: "cancelschedule", description: "Cancel a scheduled broadcast" },
+  { command: "setplan",        description: "Change plan price (setplan list / setplan id price)" },
+  { command: "discount",       description: "Give user a % discount (discount user_id percent)" },
+  { command: "topbuyers",      description: "Top 10 highest spending customers" },
   { command: "ping",           description: "Check bot & DB health" },
   { command: "admin",          description: "Open admin panel" },
 ];

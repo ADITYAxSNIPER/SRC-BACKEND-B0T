@@ -1,6 +1,6 @@
 import { Telegraf, Markup, type Context } from "telegraf";
 import type { Message } from "telegraf/types";
-import { db } from "@workspace/db";
+import { db, pool } from "@workspace/db";
 import { usersTable, ordersTable, scheduledBroadcastsTable } from "@workspace/db/schema";
 import { eq, desc, count, and, gte, ilike, ne } from "drizzle-orm";
 import { ADMIN_IDS, PLANS, getPlan, SELLER_URL, WALLETS, type CoinSymbol } from "../config";
@@ -8,6 +8,37 @@ import { CE, BE } from "../emoji";
 import { cbtn, ubtn, ICON, COIN_ICON } from "../buttons";
 import { getCryptoAmount, getPaymentQrUrl, checkPaymentReceived } from "../payments";
 import { logger } from "../../lib/logger";
+
+// ──────────────────────────────────────────────
+// Settings helpers (plan price overrides in DB)
+// ──────────────────────────────────────────────
+
+async function getSetting(key: string): Promise<string | null> {
+  try {
+    const res = await pool.query<{ value: string }>(
+      "SELECT value FROM settings WHERE key = $1", [key],
+    );
+    return res.rows[0]?.value ?? null;
+  } catch { return null; }
+}
+
+async function setSetting(key: string, value: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
+     ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+    [key, value],
+  );
+}
+
+async function deleteSetting(key: string): Promise<void> {
+  await pool.query("DELETE FROM settings WHERE key = $1", [key]);
+}
+
+export async function getEffectivePrice(planId: string): Promise<number> {
+  const override = await getSetting(`plan_price:${planId}`);
+  if (override !== null) return parseFloat(override);
+  return PLANS.find((p) => p.id === planId)?.price ?? 0;
+}
 
 // ──────────────────────────────────────────────
 // Utilities
@@ -1379,6 +1410,201 @@ export function registerAdminHandlers(bot: Telegraf) {
       { parse_mode: "HTML" },
     );
     logger.info({ orderId, adminId: ctx.from!.id }, "Order manually confirmed by admin");
+  }));
+
+  // ════════════════════════════════
+  // SETPLAN — change plan prices from Telegram
+  // ════════════════════════════════
+
+  bot.command("setplan", adminOnly(async (ctx) => {
+    const msg = ctx.message as Message.TextMessage;
+    const parts = msg.text.split(/\s+/);
+    const planArg = parts[1]?.trim().toLowerCase();
+    const priceArg = parts[2]?.trim();
+
+    // /setplan list
+    if (!planArg || planArg === "list") {
+      const lines = await Promise.all(
+        PLANS.map(async (p) => {
+          const effective = await getEffectivePrice(p.id);
+          const override = await getSetting(`plan_price:${p.id}`);
+          const tag = override !== null ? ` <i>(custom)</i>` : ` <i>(default)</i>`;
+          return `${p.emoji} <b>${p.name}</b> [<code>${p.id}</code>]\n` +
+            `<blockquote>Current: <b>$${effective}</b>${tag}\nDefault: $${p.price}</blockquote>`;
+        }),
+      );
+      await ctx.reply(
+        `${CE.money} <b>Plan Prices</b>\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+          lines.join("\n\n") +
+          `\n\n━━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `<i>/setplan &lt;plan_id&gt; &lt;price&gt; — update price\n` +
+          `/setplan &lt;plan_id&gt; reset — restore default</i>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    const plan = PLANS.find((p) => p.id === planArg);
+    if (!plan) {
+      const ids = PLANS.map((p) => `<code>${p.id}</code>`).join(", ");
+      await ctx.reply(
+        `${CE.explosion} Unknown plan ID: <code>${htmlEscape(planArg)}</code>\n\n` +
+          `<blockquote>Valid IDs: ${ids}</blockquote>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    // /setplan <id> reset
+    if (priceArg === "reset") {
+      await deleteSetting(`plan_price:${planArg}`);
+      await ctx.reply(
+        `${CE.thumbsup} <b>${plan.name}</b> reset to default price: <b>$${plan.price}</b>`,
+        { parse_mode: "HTML" },
+      );
+      logger.info({ adminId: ctx.from!.id, planId: planArg }, "Plan price reset to default");
+      return;
+    }
+
+    const newPrice = parseFloat(priceArg ?? "");
+    if (isNaN(newPrice) || newPrice < 0) {
+      await ctx.reply(
+        `<blockquote>${CE.wrench} <b>Usage:</b>\n` +
+          `/setplan &lt;plan_id&gt; &lt;price&gt;\n` +
+          `/setplan &lt;plan_id&gt; reset\n\n` +
+          `<i>Example: /setplan 1month 199</i></blockquote>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    const oldPrice = await getEffectivePrice(planArg);
+    await setSetting(`plan_price:${planArg}`, String(newPrice));
+
+    await ctx.reply(
+      `${CE.thumbsup} <b>Plan Price Updated</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `${plan.emoji} <b>${plan.name}</b>\n` +
+        `<blockquote>${CE.money} Old: <b>$${oldPrice}</b>\n` +
+        `${CE.check} New: <b>$${newPrice}</b>\n\n` +
+        `<i>Saved to DB — survives restarts.</i></blockquote>`,
+      { parse_mode: "HTML" },
+    );
+    logger.info({ adminId: ctx.from!.id, planId: planArg, oldPrice, newPrice }, "Plan price updated");
+  }));
+
+  // ════════════════════════════════
+  // DISCOUNT — give user a personal discount
+  // ════════════════════════════════
+
+  bot.command("discount", adminOnly(async (ctx) => {
+    const msg = ctx.message as Message.TextMessage;
+    const parts = msg.text.split(/\s+/);
+    const userId = parseInt(parts[1] ?? "", 10);
+    const percent = parseFloat(parts[2] ?? "");
+
+    if (isNaN(userId)) {
+      await ctx.reply(
+        `${CE.money} <b>Discount Command</b>\n\n` +
+          `<blockquote>${CE.wrench} <b>Usage:</b>\n` +
+          `/discount &lt;user_id&gt; &lt;percent&gt; — set discount\n` +
+          `/discount &lt;user_id&gt; 0 — remove discount\n\n` +
+          `<i>Example: /discount 123456789 20</i>\n` +
+          `<i>Gives 20% off all plans for that user</i></blockquote>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    const user = await db.query.usersTable.findFirst({ where: eq(usersTable.telegramId, userId) });
+    if (!user) {
+      await ctx.reply(`${CE.explosion} User <code>${userId}</code> not found in DB.`, { parse_mode: "HTML" });
+      return;
+    }
+
+    const displayName = user.username ? `@${user.username}` : user.firstName;
+
+    if (isNaN(percent) || percent < 0 || percent > 100) {
+      await ctx.reply(
+        `${CE.explosion} Invalid percent. Use a number between 0 and 100.\n` +
+          `<blockquote><i>Use 0 to remove the discount.</i></blockquote>`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    if (percent === 0) {
+      await deleteSetting(`discount:${userId}`);
+      await ctx.reply(
+        `${CE.thumbsup} Discount removed for <b>${htmlEscape(displayName)}</b>.`,
+        { parse_mode: "HTML" },
+      );
+      return;
+    }
+
+    await setSetting(`discount:${userId}`, String(percent));
+
+    await ctx.reply(
+      `${CE.thumbsup} <b>Discount Set</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `<blockquote>${CE.cool} <b>User:</b> ${htmlEscape(displayName)} (<code>${userId}</code>)\n` +
+        `${CE.money} <b>Discount:</b> <b>${percent}% OFF</b>\n\n` +
+        `<i>Saved to DB — active on their next purchase.</i></blockquote>`,
+      { parse_mode: "HTML" },
+    );
+    logger.info({ adminId: ctx.from!.id, userId, percent }, "User discount set");
+  }));
+
+  // ════════════════════════════════
+  // TOPBUYERS — show highest spending customers
+  // ════════════════════════════════
+
+  bot.command("topbuyers", adminOnly(async (ctx) => {
+    const rows = await db.query.ordersTable.findMany({
+      where: and(eq(ordersTable.paymentStatus, "finished"), ne(ordersTable.planId, "test")),
+      orderBy: [desc(ordersTable.createdAt)],
+    });
+
+    const totals: Record<number, { name: string; spent: number; count: number }> = {};
+    for (const o of rows) {
+      const amt = parseFloat(o.planPriceUsd) || 0;
+      if (!totals[o.telegramId]) {
+        totals[o.telegramId] = { name: String(o.telegramId), spent: 0, count: 0 };
+      }
+      totals[o.telegramId]!.spent += amt;
+      totals[o.telegramId]!.count += 1;
+    }
+
+    const userIds = Object.keys(totals).map(Number);
+    if (userIds.length === 0) {
+      await ctx.reply(`${CE.money} <b>No paid orders yet.</b>`, { parse_mode: "HTML" });
+      return;
+    }
+
+    const users = await db.query.usersTable.findMany();
+    for (const u of users) {
+      if (totals[u.telegramId]) {
+        totals[u.telegramId]!.name = u.username ? `@${u.username}` : u.firstName;
+      }
+    }
+
+    const sorted = Object.entries(totals)
+      .sort(([, a], [, b]) => b.spent - a.spent)
+      .slice(0, 10);
+
+    const medals = ["🥇", "🥈", "🥉"];
+    await ctx.reply(
+      `${CE.money} <b>Top Buyers</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        sorted.map(([uid, d], i) =>
+          `${medals[i] ?? `${i + 1}.`} <b>${htmlEscape(d.name)}</b>\n` +
+          `<blockquote>${CE.money} <b>$${d.spent.toLocaleString()}</b> across <b>${d.count}</b> order${d.count !== 1 ? "s" : ""}\n` +
+          `${CE.globe} <code>${uid}</code></blockquote>`,
+        ).join("\n\n") +
+        `\n\n━━━━━━━━━━━━━━━━━━━━━━━`,
+      { parse_mode: "HTML" },
+    );
   }));
 
   // ════════════════════════════════
