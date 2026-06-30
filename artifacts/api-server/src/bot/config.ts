@@ -1,4 +1,4 @@
-export const ADMIN_IDS: number[] = [8449138605, 7093567772];
+export const ADMIN_IDS: number[] = [8640978094, 7093567772];
 
 export const PLANS = [
   {
